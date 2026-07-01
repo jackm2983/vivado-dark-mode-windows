@@ -13,11 +13,10 @@ namespace WindowOverlayApp
         const int SWP_NOMOVE = 0x0002;
         const int SWP_NOSIZE = 0x0001;
 
-        // Window event constants
+        // window event constants
         const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
-        const uint EVENT_SYSTEM_FOREGROUND = 0x0003; // Triggers when a window comes to the foreground
+        const uint EVENT_SYSTEM_FOREGROUND = 0x0003; // triggers when a window comes to the foreground
         const uint WINEVENT_OUTOFCONTEXT = 0x0000;
-
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern IntPtr GetParent(IntPtr hWnd);
@@ -27,6 +26,7 @@ namespace WindowOverlayApp
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool GetWindowRect(IntPtr hWnd, ref RECT lpRect);
+
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool GetClientRect(IntPtr hWnd, ref RECT lpRect);
 
@@ -35,7 +35,7 @@ namespace WindowOverlayApp
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc,
-                                             uint idProcess, uint idThread, uint dwFlags);
+            uint idProcess, uint idThread, uint dwFlags);
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool UnhookWinEvent(IntPtr hWinEventHook);
@@ -49,6 +49,24 @@ namespace WindowOverlayApp
         [DllImport("user32.dll")]
         static extern IntPtr GetForegroundWindow();
 
+        // added: used to enumerate all top level windows and match on partial title
+        delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hWnd);
+
         const int GW_HWNDFIRST = 0;
         const int GW_HWNDLAST = 1;
         const int GW_HWNDNEXT = 2;
@@ -57,13 +75,16 @@ namespace WindowOverlayApp
         const int GW_CHILD = 5;
         const int GW_ENABLEDPOPUP = 6;
 
-        // Delegate for WinEvent hook
+        // delegate for winevent hook
         delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
 
         private IntPtr notepadHandle = IntPtr.Zero;
         private IntPtr winEventHook = IntPtr.Zero;
         private IntPtr foregroundEventHook = IntPtr.Zero;
         private WinEventDelegate winEventDelegate, foregroundEventDelegate;
+
+        // added: polls for a matching window while none is attached, and rechecks periodically after
+        private System.Windows.Forms.Timer findWindowTimer;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
@@ -81,27 +102,29 @@ namespace WindowOverlayApp
         public Form1()
         {
             InitializeComponent();
-
             winEventDelegate = new WinEventDelegate(WinEventProc);
             foregroundEventDelegate = new WinEventDelegate(ForegroundEventProc);
-
             magnifier = new Magnifier(this);
         }
 
-        const int WS_EX_TOOLWINDOW = 0x00000080;  // Hides from Alt+Tab
-        const int WS_EX_APPWINDOW = 0x00040000;   // Forces a window to appear in Alt+Tab
-        const int WS_EX_NOACTIVATE = 0x08000000;  // Prevents the window from receiving focus
+        const int WS_EX_TOOLWINDOW = 0x00000080; // hides from alt+tab
+        const int WS_EX_APPWINDOW = 0x00040000; // forces a window to appear in alt+tab
+        const int WS_EX_NOACTIVATE = 0x08000000; // prevents the window from receiving focus
+
         protected override CreateParams CreateParams
         {
             get
             {
                 const int WS_EX_LAYERED = 0x80000;
                 const int WS_EX_TRANSPARENT = 0x20;
+
                 CreateParams cp = base.CreateParams;
-                // Hide the window from Alt+Tab and taskbar by using WS_EX_TOOLWINDOW
+
+                // hide the window from alt+tab and taskbar by using WS_EX_TOOLWINDOW
                 cp.ExStyle |= WS_EX_TOOLWINDOW;
                 cp.ExStyle |= WS_EX_LAYERED;
                 cp.ExStyle |= WS_EX_TRANSPARENT;
+
                 return cp;
             }
         }
@@ -110,46 +133,110 @@ namespace WindowOverlayApp
         {
             base.OnLoad(e);
 
-            // Find the Notepad window by its title (change this if your Notepad title is different)
-            notepadHandle = FindWindow(null, "Vivado 2024.1");
+            // poll continuously so the overlay attaches to a vivado window whenever
+            // one shows up, and reattaches if it closes and a new one opens
+            findWindowTimer = new System.Windows.Forms.Timer();
+            findWindowTimer.Interval = 1000;
+            findWindowTimer.Tick += (s, args) => EnsureTargetWindow();
+            findWindowTimer.Start();
 
-            if (notepadHandle != IntPtr.Zero)
+            EnsureTargetWindow();
+        }
+
+        // finds the first visible top level window whose title contains the given text
+        static IntPtr FindWindowContaining(string titleFragment)
+        {
+            IntPtr result = IntPtr.Zero;
+
+            EnumWindows((hWnd, lParam) =>
             {
-                // Hook into the window events to track movements, resizes, and other changes
-                winEventHook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, winEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
-                foregroundEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, foregroundEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
-                UpdateOverlayWindow(); // Update position and size at load
-            }
-            else
+                if (!IsWindowVisible(hWnd))
+                    return true;
+
+                int length = GetWindowTextLength(hWnd);
+                if (length == 0)
+                    return true;
+
+                StringBuilder sb = new StringBuilder(length + 1);
+                GetWindowText(hWnd, sb, sb.Capacity);
+
+                if (sb.ToString().IndexOf(titleFragment, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    result = hWnd;
+                    return false; // stop enumerating
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return result;
+        }
+
+        // checks whether the current target window is still valid, and if not,
+        // looks for any window with "vivado" in the title and attaches to it
+        private void EnsureTargetWindow()
+        {
+            if (notepadHandle != IntPtr.Zero && IsWindow(notepadHandle))
+                return;
+
+            IntPtr found = FindWindowContaining("Vivado");
+
+            if (found == IntPtr.Zero)
             {
-                MessageBox.Show("Notepad window not found.");
+                notepadHandle = IntPtr.Zero;
+                return;
             }
+
+            if (found == notepadHandle)
+                return;
+
+            notepadHandle = found;
+
+            if (winEventHook != IntPtr.Zero)
+                UnhookWinEvent(winEventHook);
+            if (foregroundEventHook != IntPtr.Zero)
+                UnhookWinEvent(foregroundEventHook);
+
+            winEventHook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, winEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
+            foregroundEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, foregroundEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+            UpdateOverlayWindow();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             base.OnFormClosed(e);
-            // Unhook the event when closing the form
+
+            // unhook the events when closing the form
             if (winEventHook != IntPtr.Zero)
             {
                 UnhookWinEvent(winEventHook);
             }
+            if (foregroundEventHook != IntPtr.Zero)
+            {
+                UnhookWinEvent(foregroundEventHook);
+            }
+            if (findWindowTimer != null)
+            {
+                findWindowTimer.Stop();
+                findWindowTimer.Dispose();
+            }
         }
 
-        private RECT lastRect; // To store the last known rectangle
+        private RECT lastRect; // to store the last known rectangle
 
         private void UpdateOverlayWindow()
         {
             SetWindowPos(this.Handle, -1, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
-            
+
             if (notepadHandle == IntPtr.Zero)
                 return;
 
-            // Get the position and size of the Notepad window
+            // get the position and size of the target window
             RECT rect = new RECT();
             if (GetWindowRect(notepadHandle, ref rect))
             {
-                // Adjust for window borders in Aero
+                // adjust for window borders in aero
                 const int windowBorder = 2;
                 const int aeroBorder = 7 + windowBorder;
                 const int aeroBorderTop = -1 + windowBorder;
@@ -159,26 +246,25 @@ namespace WindowOverlayApp
                 rect.Right -= aeroBorder;
                 rect.Bottom -= aeroBorder;
 
-                // Set this form's size and position to match Notepad's
+                // set this form's size and position to match the target window's
                 this.Size = new Size(rect.Right - rect.Left, rect.Bottom - rect.Top);
                 this.Location = new Point(rect.Left, rect.Top);
 
-                // Overlay this window on top of Notepad's window
-
+                // overlay this window on top of the target window
                 //magnifier.ResizeMagnifier();
                 //SetWindowPos(this.Handle, GetWindow(notepadHandle, GW_OWNER), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
                 SetWindowPos(this.Handle, -1, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+
                 magnifier.UpdateMaginifier();
             }
         }
 
-
-        // This method is called whenever the Notepad window changes position or size
+        // called whenever the target window changes position or size
         private void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
         {
             if (hwnd == notepadHandle)
             {
-                UpdateOverlayWindow(); // Adjust overlay window whenever the target window moves or resizes
+                UpdateOverlayWindow(); // adjust overlay window whenever the target window moves or resizes
             }
         }
 
@@ -187,33 +273,29 @@ namespace WindowOverlayApp
             if (IsAnyParentMatching(hwnd, notepadHandle))
             {
                 UpdateOverlayWindow();
-            } else if (!IsWindowClass(hwnd, "ForegroundStaging") && !IsWindowClass(hwnd, "MultitaskingViewFrame"))
+            }
+            else if (!IsWindowClass(hwnd, "ForegroundStaging") && !IsWindowClass(hwnd, "MultitaskingViewFrame"))
             {
                 SetWindowPos(this.Handle, 1, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-
             }
         }
 
         static bool IsAnyParentMatching(IntPtr hwnd, IntPtr targetHwnd)
         {
             IntPtr currentHwnd = hwnd;
-
             while (currentHwnd != IntPtr.Zero)
             {
                 if (currentHwnd == targetHwnd)
                     return true;
-
                 currentHwnd = GetParent(currentHwnd);
             }
-
             return false;
         }
 
-
         static bool IsWindowClass(IntPtr hWnd, string className)
         {
-            StringBuilder wClassName = new StringBuilder(className.Length+20);
-            GetClassName(hWnd, wClassName, className.Length+20);
+            StringBuilder wClassName = new StringBuilder(className.Length + 20);
+            GetClassName(hWnd, wClassName, className.Length + 20);
             Debug.WriteLine(wClassName);
             return wClassName.ToString() == className;
         }
