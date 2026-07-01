@@ -49,7 +49,6 @@ namespace WindowOverlayApp
         [DllImport("user32.dll")]
         static extern IntPtr GetForegroundWindow();
 
-        // added: used to enumerate all top level windows and match on partial title
         delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll")]
@@ -70,12 +69,11 @@ namespace WindowOverlayApp
         const int GW_HWNDFIRST = 0;
         const int GW_HWNDLAST = 1;
         const int GW_HWNDNEXT = 2;
-        const int GW_HWNDPREV = 3;
+        const uint GW_HWNDPREV = 3; // window directly above hWnd in z order
         const int GW_OWNER = 4;
         const int GW_CHILD = 5;
         const int GW_ENABLEDPOPUP = 6;
 
-        // delegate for winevent hook
         delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
 
         private IntPtr notepadHandle = IntPtr.Zero;
@@ -83,7 +81,6 @@ namespace WindowOverlayApp
         private IntPtr foregroundEventHook = IntPtr.Zero;
         private WinEventDelegate winEventDelegate, foregroundEventDelegate;
 
-        // added: polls for a matching window while none is attached, and rechecks periodically after
         private System.Windows.Forms.Timer findWindowTimer;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -120,7 +117,6 @@ namespace WindowOverlayApp
 
                 CreateParams cp = base.CreateParams;
 
-                // hide the window from alt+tab and taskbar by using WS_EX_TOOLWINDOW
                 cp.ExStyle |= WS_EX_TOOLWINDOW;
                 cp.ExStyle |= WS_EX_LAYERED;
                 cp.ExStyle |= WS_EX_TRANSPARENT;
@@ -133,8 +129,6 @@ namespace WindowOverlayApp
         {
             base.OnLoad(e);
 
-            // poll continuously so the overlay attaches to a vivado window whenever
-            // one shows up, and reattaches if it closes and a new one opens
             findWindowTimer = new System.Windows.Forms.Timer();
             findWindowTimer.Interval = 1000;
             findWindowTimer.Tick += (s, args) => EnsureTargetWindow();
@@ -163,7 +157,7 @@ namespace WindowOverlayApp
                 if (sb.ToString().IndexOf(titleFragment, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     result = hWnd;
-                    return false; // stop enumerating
+                    return false;
                 }
 
                 return true;
@@ -179,7 +173,7 @@ namespace WindowOverlayApp
             if (notepadHandle != IntPtr.Zero && IsWindow(notepadHandle))
                 return;
 
-            IntPtr found = FindWindowContaining("@fpganode");
+            IntPtr found = FindWindowContaining("Vivado");
 
             if (found == IntPtr.Zero)
             {
@@ -207,7 +201,6 @@ namespace WindowOverlayApp
         {
             base.OnFormClosed(e);
 
-            // unhook the events when closing the form
             if (winEventHook != IntPtr.Zero)
             {
                 UnhookWinEvent(winEventHook);
@@ -223,20 +216,16 @@ namespace WindowOverlayApp
             }
         }
 
-        private RECT lastRect; // to store the last known rectangle
+        private RECT lastRect;
 
         private void UpdateOverlayWindow()
         {
-            SetWindowPos(this.Handle, -1, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
-
             if (notepadHandle == IntPtr.Zero)
                 return;
 
-            // get the position and size of the target window
             RECT rect = new RECT();
             if (GetWindowRect(notepadHandle, ref rect))
             {
-                // adjust for window borders in aero
                 const int windowBorder = 2;
                 const int aeroBorder = 7 + windowBorder;
                 const int aeroBorderTop = -1 + windowBorder;
@@ -246,14 +235,17 @@ namespace WindowOverlayApp
                 rect.Right -= aeroBorder;
                 rect.Bottom -= aeroBorder;
 
-                // set this form's size and position to match the target window's
                 this.Size = new Size(rect.Right - rect.Left, rect.Bottom - rect.Top);
                 this.Location = new Point(rect.Left, rect.Top);
 
-                // overlay this window on top of the target window
-                //magnifier.ResizeMagnifier();
-                //SetWindowPos(this.Handle, GetWindow(notepadHandle, GW_OWNER), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
-                SetWindowPos(this.Handle, -1, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+                // insert the overlay directly above vivado in z order, by placing it
+                // after whichever window currently sits above vivado. if nothing sits
+                // above vivado, insert after vivado itself, which puts us right on top
+                IntPtr insertAfter = GetWindow(notepadHandle, GW_HWNDPREV);
+                if (insertAfter == IntPtr.Zero)
+                    insertAfter = notepadHandle;
+
+                SetWindowPos(this.Handle, insertAfter, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
 
                 magnifier.UpdateMaginifier();
             }
@@ -264,40 +256,16 @@ namespace WindowOverlayApp
         {
             if (hwnd == notepadHandle)
             {
-                UpdateOverlayWindow(); // adjust overlay window whenever the target window moves or resizes
-            }
-        }
-
-        private void ForegroundEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
-        {
-            if (IsAnyParentMatching(hwnd, notepadHandle))
-            {
                 UpdateOverlayWindow();
             }
-            else if (!IsWindowClass(hwnd, "ForegroundStaging") && !IsWindowClass(hwnd, "MultitaskingViewFrame"))
-            {
-                SetWindowPos(this.Handle, 1, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-            }
         }
 
-        static bool IsAnyParentMatching(IntPtr hwnd, IntPtr targetHwnd)
+        // reposition the overlay any time the foreground window changes, since
+        // z order may have shifted, this keeps the overlay following vivado
+        // even when vivado itself is not the active window
+        private void ForegroundEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
         {
-            IntPtr currentHwnd = hwnd;
-            while (currentHwnd != IntPtr.Zero)
-            {
-                if (currentHwnd == targetHwnd)
-                    return true;
-                currentHwnd = GetParent(currentHwnd);
-            }
-            return false;
-        }
-
-        static bool IsWindowClass(IntPtr hWnd, string className)
-        {
-            StringBuilder wClassName = new StringBuilder(className.Length + 20);
-            GetClassName(hWnd, wClassName, className.Length + 20);
-            Debug.WriteLine(wClassName);
-            return wClassName.ToString() == className;
+            UpdateOverlayWindow();
         }
 
         private void textBox1_TextChanged(object sender, EventArgs e)
