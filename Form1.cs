@@ -82,6 +82,7 @@ namespace WindowOverlayApp
         private WinEventDelegate winEventDelegate, foregroundEventDelegate;
 
         private System.Windows.Forms.Timer findWindowTimer;
+        private System.Windows.Forms.Timer updateDebounceTimer;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
@@ -102,6 +103,14 @@ namespace WindowOverlayApp
             winEventDelegate = new WinEventDelegate(WinEventProc);
             foregroundEventDelegate = new WinEventDelegate(ForegroundEventProc);
             magnifier = new Magnifier(this);
+
+            updateDebounceTimer = new System.Windows.Forms.Timer();
+            updateDebounceTimer.Interval = 150;
+            updateDebounceTimer.Tick += (s, args) =>
+            {
+                updateDebounceTimer.Stop();
+                ApplyOverlayUpdate();
+            };
         }
 
         const int WS_EX_TOOLWINDOW = 0x00000080; // hides from alt+tab
@@ -130,8 +139,12 @@ namespace WindowOverlayApp
             base.OnLoad(e);
 
             findWindowTimer = new System.Windows.Forms.Timer();
-            findWindowTimer.Interval = 1000;
-            findWindowTimer.Tick += (s, args) => EnsureTargetWindow();
+            findWindowTimer.Interval = 250;
+            findWindowTimer.Tick += (s, args) =>
+            {
+                EnsureTargetWindow();
+                ApplyOverlayUpdate();
+            };
             findWindowTimer.Start();
 
             EnsureTargetWindow();
@@ -194,7 +207,7 @@ namespace WindowOverlayApp
             winEventHook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, winEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
             foregroundEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, foregroundEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
 
-            UpdateOverlayWindow();
+            ApplyOverlayUpdate();
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -214,11 +227,28 @@ namespace WindowOverlayApp
                 findWindowTimer.Stop();
                 findWindowTimer.Dispose();
             }
+            if (updateDebounceTimer != null)
+            {
+                updateDebounceTimer.Stop();
+                updateDebounceTimer.Dispose();
+            }
         }
 
         private RECT lastRect;
 
+        // called by event hooks, restarts the debounce timer instead of updating
+        // immediately, so bursts of events collapse into a single settled update
         private void UpdateOverlayWindow()
+        {
+            if (notepadHandle == IntPtr.Zero)
+                return;
+
+            updateDebounceTimer.Stop();
+            updateDebounceTimer.Start();
+        }
+
+        // does the actual repositioning and magnifier refresh
+        private void ApplyOverlayUpdate()
         {
             if (notepadHandle == IntPtr.Zero)
                 return;
@@ -238,14 +268,17 @@ namespace WindowOverlayApp
                 this.Size = new Size(rect.Right - rect.Left, rect.Bottom - rect.Top);
                 this.Location = new Point(rect.Left, rect.Top);
 
-                // insert the overlay directly above vivado in z order, by placing it
-                // after whichever window currently sits above vivado. if nothing sits
-                // above vivado, insert after vivado itself, which puts us right on top
                 IntPtr insertAfter = GetWindow(notepadHandle, GW_HWNDPREV);
                 if (insertAfter == IntPtr.Zero)
                     insertAfter = notepadHandle;
 
-                SetWindowPos(this.Handle, insertAfter, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+                // skip repositioning if we would be inserting ourselves after ourselves,
+                // this happens when a new window opens above us and we are still the
+                // window directly above vivado, in that case we are already correctly placed
+                if (insertAfter != this.Handle)
+                {
+                    SetWindowPos(this.Handle, insertAfter, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+                }
 
                 magnifier.UpdateMaginifier();
             }
