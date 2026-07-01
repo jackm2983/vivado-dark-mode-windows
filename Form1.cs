@@ -179,7 +179,7 @@ namespace WindowOverlayApp
             if (notepadHandle != IntPtr.Zero && IsWindow(notepadHandle))
                 return;
 
-            IntPtr found = FindWindowContaining("Vivado");
+            IntPtr found = FindWindowContaining("@fpganode");
 
             if (found == IntPtr.Zero)
             {
