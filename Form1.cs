@@ -186,11 +186,12 @@ namespace WindowOverlayApp
             if (notepadHandle != IntPtr.Zero && IsWindow(notepadHandle))
                 return;
 
-            IntPtr found = FindWindowContaining("Vivado 20");
+            IntPtr found = FindWindowContaining("TigerVNC");
 
             if (found == IntPtr.Zero)
             {
                 notepadHandle = IntPtr.Zero;
+                this.Hide();
                 return;
             }
 
@@ -198,6 +199,7 @@ namespace WindowOverlayApp
                 return;
 
             notepadHandle = found;
+            this.Show();
 
             if (winEventHook != IntPtr.Zero)
                 UnhookWinEvent(winEventHook);

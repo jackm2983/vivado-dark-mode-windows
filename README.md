@@ -4,6 +4,9 @@
 
 This uses the Windows magnification API to invert a window and make it dark mode.
 
+>> Make sure to go into Form1.cs to change the name of the window you want to invert:
+```EX. IntPtr found = FindWindowContaining("TigerVNC");```
+
 ## Installation Instructions
 
 1. Clone the repo in C:\Github.
